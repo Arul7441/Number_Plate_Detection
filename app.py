@@ -29,9 +29,7 @@ st.title("GUVI's Final Number Plate Detection System")
 
 @st.cache_resource
 def cached_model(model_path_text: str):
-
     selected = model_path_text.strip() or None
-
     return load_yolo_model(selected)
 
 # ===================================================
@@ -39,27 +37,11 @@ def cached_model(model_path_text: str):
 # ===================================================
 
 def decode_uploaded_image(file_obj):
-
-    # Reset pointer
     file_obj.seek(0)
-
-    # Read bytes safely
-    file_bytes = np.asarray(
-        bytearray(file_obj.read()),
-        dtype=np.uint8
-    )
-
-    # Decode image
-    image = cv2.imdecode(
-        file_bytes,
-        cv2.IMREAD_COLOR
-    )
-
+    file_bytes = np.asarray(bytearray(file_obj.read()), dtype=np.uint8)
+    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     if image is None:
-        raise ValueError(
-            "Invalid input image."
-        )
-
+        raise ValueError("Invalid input image.")
     return image
 
 # ===================================================
@@ -67,13 +49,9 @@ def decode_uploaded_image(file_obj):
 # ===================================================
 
 def rows_from_detections(detections):
-
     rows = []
-
     for idx, detection in enumerate(detections, start=1):
-
         x1, y1, x2, y2 = detection.box
-
         rows.append({
             "No.": idx,
             "Plate Text": detection.text or "Unreadable",
@@ -83,36 +61,43 @@ def rows_from_detections(detections):
             "Box": f"{x1},{y1},{x2},{y2}",
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
-
     return rows
 
 # ===================================================
 # PREPROCESSING OUTPUTS
+# BUG-FIX: Was always using detections[0] (first box).
+# Now selects the detection with the highest OCR confidence
+# that also has a non-empty plate text, so the preprocessing
+# panel shows the best-read plate, not an arbitrary one.
 # ===================================================
 
-def preprocessing_images(image_bgr, detections):
+def _best_detection_for_preview(detections):
+    """Return the detection most worth previewing (highest OCR confidence with text)."""
+    with_text = [d for d in detections if d.text]
+    if with_text:
+        return max(with_text, key=lambda d: d.ocr_confidence)
+    # Fall back to highest detector confidence if no OCR text anywhere
+    return max(detections, key=lambda d: d.detector_confidence)
 
+
+def preprocessing_images(image_bgr, detections):
     if not detections:
         return []
 
-    x1, y1, x2, y2 = detections[0].box
+    best = _best_detection_for_preview(detections)
+    x1, y1, x2, y2 = best.box
 
     crop = image_bgr[y1:y2, x1:x2]
-
     if crop.size == 0:
         return []
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-
     bilateral = cv2.bilateralFilter(gray, 11, 17, 17)
-
     thresh = cv2.adaptiveThreshold(
-        bilateral,
-        255,
+        bilateral, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        11,
-        2
+        11, 2,
     )
 
     return [
@@ -127,52 +112,43 @@ def preprocessing_images(image_bgr, detections):
 # ===================================================
 
 with st.sidebar:
-
     st.header("Settings")
 
-    # AUTO FIND MODEL
     auto_model = find_model_path()
 
-    # FORCE DEFAULT MODEL
     if auto_model:
         default_model = str(auto_model)
     else:
         default_model = "runs/detect/train-7/weights/best.pt"
 
     st.write("Detected model path:")
-
     st.code(default_model)
 
-    model_path_text = st.text_input(
-        "YOLO model path",
-        value=default_model
-    )
+    model_path_text = st.text_input("YOLO model path", value=default_model)
 
     conf = st.slider(
         "Detection confidence",
-        min_value=0.05,
-        max_value=0.90,
-        value=0.25,
-        step=0.05
+        min_value=0.05, max_value=0.90, value=0.25, step=0.05,
     )
 
     imgsz = st.select_slider(
         "Inference image size",
-        options=[320, 480, 640],
-        value=480
+        options=[320, 480, 640, 960],
+        value=640,
     )
 
     padding = st.slider(
         "Crop padding",
-        min_value=0,
-        max_value=20,
-        value=2,
-        step=1
+        min_value=0, max_value=20, value=4, step=1,
     )
 
-    use_cv_fallback = st.toggle(
-        "Use OpenCV fallback",
-        value=False
+    use_cv_fallback = st.toggle("Use OpenCV fallback", value=True)
+
+    st.divider()
+    st.caption(
+        "💡 Tip: Lower detection confidence catches more plates "
+        "at the cost of false positives. OCR confidence is shown "
+        "in the table so you can judge read quality."
     )
 
 # ===================================================
@@ -182,54 +158,35 @@ with st.sidebar:
 model, resolved_model_path = cached_model(model_path_text)
 
 if resolved_model_path:
-
-    st.sidebar.success(
-        f"YOLO model loaded:\n{resolved_model_path.name}"
-    )
-
+    st.sidebar.success(f"YOLO model loaded:\n{resolved_model_path.name}")
 else:
-
-    st.sidebar.error(
-        "No trained YOLO weights found."
-    )
+    st.sidebar.error("No trained YOLO weights found.")
 
 # ===================================================
 # INPUT SOURCE
 # ===================================================
 
-source = st.radio(
-    "Input source",
-    ["Upload image", "Camera"],
-    horizontal=True
-)
+source = st.radio("Input source", ["Upload image", "Camera"], horizontal=True)
 
 input_file = None
 
 if source == "Upload image":
-
     input_file = st.file_uploader(
         "Upload vehicle image",
-        type=["jpg", "jpeg", "png"]
+        type=["jpg", "jpeg", "png"],
     )
-
 else:
-
-    input_file = st.camera_input(
-        "Capture vehicle image"
-    )
+    input_file = st.camera_input("Capture vehicle image")
 
 # ===================================================
 # MAIN DETECTION
 # ===================================================
 
 if input_file is not None:
-
     try:
-
         image_bgr = decode_uploaded_image(input_file)
 
         with st.spinner("Detecting number plate..."):
-
             detections, metrics = detect_plates(
                 image_bgr,
                 model=model,
@@ -239,105 +196,77 @@ if input_file is not None:
                 use_cv_fallback=use_cv_fallback,
             )
 
-        # -------------------------------------------
-
-        annotated = annotate_image(
-            image_bgr,
-            detections
-        )
-
-        annotated_rgb = cv2.cvtColor(
-            annotated,
-            cv2.COLOR_BGR2RGB
-        )
-
-        # -------------------------------------------
+        # ── Annotated result ──────────────────────────────────────────────────
+        annotated = annotate_image(image_bgr, detections)
+        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
 
         col1, col2, col3 = st.columns(3)
+        col1.metric("Detected Plates", len(detections))
+        col2.metric("Processing Time", f"{metrics.get('total_seconds', 0):.2f} sec")
+        col3.metric("Detector", detections[0].detector if detections else "None")
 
-        col1.metric(
-            "Detected Plates",
-            len(detections)
-        )
+        st.image(annotated_rgb, caption="Detection Result", use_container_width=True)
 
-        col2.metric(
-            "Processing Time",
-            f"{metrics.get('total_seconds', 0):.2f} sec"
-        )
-
-        col3.metric(
-            "Detector",
-            detections[0].detector if detections else "None"
-        )
-
-        # -------------------------------------------
-
-        st.image(
-            annotated_rgb,
-            caption="Detection Result",
-            use_container_width=True
-        )
-
-        # -------------------------------------------
-
+        # ── Preprocessing panel — shows the BEST plate crop ───────────────────
         if detections:
-
-            st.subheader("Preprocessing Output")
+            best_preview = _best_detection_for_preview(detections)
+            caption_hint = (
+                f"Showing plate: {best_preview.text or 'Unreadable'} "
+                f"(OCR conf {best_preview.ocr_confidence:.3f})"
+            )
+            st.subheader(f"Preprocessing Output  —  {caption_hint}")
 
             prep_columns = st.columns(4)
-
-            prep_images = preprocessing_images(
-                image_bgr,
-                detections
-            )
+            prep_images = preprocessing_images(image_bgr, detections)
 
             for column, (caption, prep_image) in zip(prep_columns, prep_images):
+                column.image(prep_image, caption=caption, use_container_width=True)
 
-                column.image(
-                    prep_image,
-                    caption=caption,
-                    use_container_width=True
-                )
-
-        # -------------------------------------------
-
+        # ── Results table ─────────────────────────────────────────────────────
         rows = rows_from_detections(detections)
 
         if rows:
-
-            st.success("Number plate detected successfully.")
+            readable = [r for r in rows if r["Plate Text"] != "Unreadable"]
+            if readable:
+                st.success(
+                    f"Number plate detected successfully. "
+                    f"{len(readable)} readable / {len(rows)} total."
+                )
+            else:
+                st.warning(
+                    "Plates were detected but OCR could not read any text. "
+                    "Try increasing the image resolution or adjusting crop padding."
+                )
 
             table = pd.DataFrame(rows)
 
+            # Highlight unreadable rows in amber for quick scanning
+            def _highlight_unreadable(row):
+                if row["Plate Text"] == "Unreadable":
+                    return ["background-color: #fff3cd"] * len(row)
+                return [""] * len(row)
+
             st.dataframe(
-                table,
+                table.style.apply(_highlight_unreadable, axis=1),
                 use_container_width=True,
-                hide_index=True
+                hide_index=True,
             )
 
             csv_data = table.to_csv(index=False).encode("utf-8")
-
             st.download_button(
                 "Download CSV",
                 csv_data,
                 "number_plate_results.csv",
-                "text/csv"
+                "text/csv",
             )
-
         else:
+            st.warning("No number plate detected.")
 
-            st.warning(
-                "No number plate detected."
-            )
-
-        # -------------------------------------------
-
+        # ── Performance details ───────────────────────────────────────────────
         with st.expander("Performance Details"):
-
             st.json(metrics)
 
     except Exception as exc:
-
         st.error(str(exc))
 
 # ===================================================
@@ -345,7 +274,4 @@ if input_file is not None:
 # ===================================================
 
 else:
-
-    st.info(
-        "Upload a vehicle image to start detection."
-    )
+    st.info("Upload a vehicle image to start detection.")

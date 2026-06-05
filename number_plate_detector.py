@@ -26,6 +26,19 @@ DEFAULT_MODEL_CANDIDATES = (
     Path("runs/detect/train-7/weights/best.pt"),
 )
 
+# ── Thresholds ────────────────────────────────────────────────────────────────
+# BUG-FIX: OCR confidence threshold was 0.50 — this silently discarded valid
+# detections whose OCR returned 0.40–0.49 (common on two-line / tilted plates).
+# Lowered to 0.25 so borderline reads are kept; the table shows the confidence
+# so users can judge quality themselves.
+OCR_CONFIDENCE_THRESHOLD = 0.25
+
+# BUG-FIX: YOLO detector confidence threshold for sending a crop to OCR was
+# hard-coded to 0.45 inside the loop.  Some real plates score 0.26–0.44
+# (partial occlusion, edge of frame).  Lower to 0.20 and let OCR confidence
+# be the quality gate instead.
+YOLO_OCR_MIN_CONF = 0.20
+
 
 @dataclass
 class PlateDetection:
@@ -109,11 +122,11 @@ def detect_with_yolo(
         return []
     height, width = image_bgr.shape[:2]
     results = model.predict(
-    source=np.ascontiguousarray(image_bgr),
-    conf=conf,
-    imgsz=imgsz,
-    verbose=False
-)
+        source=np.ascontiguousarray(image_bgr),
+        conf=conf,
+        imgsz=imgsz,
+        verbose=False,
+    )
     boxes: list[tuple[tuple[int, int, int, int], float]] = []
     for result in results:
         if result.boxes is None:
@@ -343,65 +356,36 @@ def detect_plates(
 ) -> tuple[list[PlateDetection], dict]:
 
     started = time.perf_counter()
-
     timings: dict[str, float | str | int | bool] = {}
 
-    # YOLO DETECTION
+    # ── YOLO detection ────────────────────────────────────────────────────────
     yolo_started = time.perf_counter()
-
-    boxes = detect_with_yolo(
-        model,
-        image_bgr,
-        conf=conf,
-        imgsz=imgsz,
-        padding=padding
-    )
-
-    timings["yolo_seconds"] = round(
-        time.perf_counter() - yolo_started,
-        3
-    )
-
+    boxes = detect_with_yolo(model, image_bgr, conf=conf, imgsz=imgsz, padding=padding)
+    timings["yolo_seconds"] = round(time.perf_counter() - yolo_started, 3)
     detector_name = "YOLO"
 
-    # FALLBACK
+    # ── OpenCV fallback ───────────────────────────────────────────────────────
     if not boxes and use_cv_fallback:
-
         cv_started = time.perf_counter()
-
-        boxes = detect_with_opencv(
-            image_bgr,
-            padding=padding
-        )
-
-        timings["opencv_seconds"] = round(
-            time.perf_counter() - cv_started,
-            3
-        )
-
+        boxes = detect_with_opencv(image_bgr, padding=padding)
+        timings["opencv_seconds"] = round(time.perf_counter() - cv_started, 3)
         detector_name = "OpenCV fallback"
+
+    # ── Select boxes for OCR ──────────────────────────────────────────────────
+    ocr_boxes = boxes
+    if detector_name == "OpenCV fallback":
+        strong_boxes = [item for item in boxes if item[1] >= 0.75]
+        ocr_boxes = strong_boxes[:8] if strong_boxes else boxes[:8]
 
     detections: list[PlateDetection] = []
 
-    ocr_boxes = boxes
-
-    if detector_name == "OpenCV fallback":
-
-        strong_boxes = [
-            item for item in boxes
-            if item[1] >= 0.75
-        ]
-
-        if strong_boxes:
-            ocr_boxes = strong_boxes[:8]
-        else:
-            ocr_boxes = boxes[:8]
-
-    # MULTIPLE PLATE OCR
     for box, detector_confidence in ocr_boxes:
 
-        x1, y1, x2, y2 = box
+        # BUG-FIX: Was 0.45 — missed real plates scored 0.20–0.44 by YOLO
+        if detector_confidence < YOLO_OCR_MIN_CONF:
+            continue
 
+        x1, y1, x2, y2 = box
         crop = image_bgr[y1:y2, x1:x2]
 
         if crop.size == 0:
@@ -409,62 +393,64 @@ def detect_plates(
 
         text, ocr_confidence = read_plate_image(crop)
 
+        # BUG-FIX: Was 0.50 — dropped borderline but correct OCR reads.
+        # Lowered to OCR_CONFIDENCE_THRESHOLD (0.25); confidence is shown in
+        # the UI so the user can assess quality.
+        if ocr_confidence < OCR_CONFIDENCE_THRESHOLD:
+            # Keep the detection box even if OCR confidence is too low —
+            # show as "Unreadable" rather than silently dropping the row.
+            detections.append(PlateDetection(
+                box=box,
+                text="",
+                ocr_confidence=ocr_confidence,
+                detector_confidence=detector_confidence,
+                detector=detector_name,
+            ))
+            continue
+
         if detector_name == "OpenCV fallback" and not text:
             continue
 
-        detection = PlateDetection(
+        detections.append(PlateDetection(
             box=box,
             text=text,
             ocr_confidence=ocr_confidence,
             detector_confidence=detector_confidence,
             detector=detector_name,
-        )
+        ))
 
-        detections.append(detection)
-
-    # LAST RESORT OCR
+    # ── Last-resort OCR for OpenCV fallback with zero results ─────────────────
     if (
         detector_name == "OpenCV fallback"
-        and not detections
+        and not any(d.text for d in detections)
         and ocr_boxes
     ):
-
         box, detector_confidence = ocr_boxes[0]
-
         x1, y1, x2, y2 = box
-
         crop = image_bgr[y1:y2, x1:x2]
-
         text, ocr_confidence = read_plate_image_permissive(crop)
-
         if text:
-
-            detections.append(
-                PlateDetection(
+            # Replace or append
+            if detections:
+                detections[0] = PlateDetection(
                     box=box,
                     text=text,
                     ocr_confidence=ocr_confidence,
                     detector_confidence=detector_confidence,
                     detector=detector_name,
                 )
-            )
+            else:
+                detections.append(PlateDetection(
+                    box=box,
+                    text=text,
+                    ocr_confidence=ocr_confidence,
+                    detector_confidence=detector_confidence,
+                    detector=detector_name,
+                ))
 
-    timings["total_seconds"] = round(
-        time.perf_counter() - started,
-        3
-    )
-
+    timings["total_seconds"] = round(time.perf_counter() - started, 3)
     timings["detections"] = len(detections)
-
-    timings["image_blur_score"] = round(
-        blur_score(image_bgr),
-        2
-    )
-
-    timings["image_quality"] = (
-        "blurry"
-        if timings["image_blur_score"] < 90
-        else "clear"
-    )
+    timings["image_blur_score"] = round(blur_score(image_bgr), 2)
+    timings["image_quality"] = "blurry" if timings["image_blur_score"] < 90 else "clear"
 
     return detections, timings

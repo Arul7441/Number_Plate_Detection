@@ -1,9 +1,6 @@
+dataset.zip
+*.pt
+runs/
 venv/
 __pycache__/
-runs/
-*.pt
-*.pyc
-*.pyo
-*.pyd
-.env
 .DS_Store

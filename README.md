@@ -1,4 +1,4 @@
-# AI Number Plate Detection System
+# GUVI's Final Number Plate Detection System
 
 This project detects Indian vehicle number plates from images, applies OCR, and shows results in a Streamlit web app. The main project flow is simple: train YOLO with labeled images, then run the app.
 
